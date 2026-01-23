@@ -14,7 +14,6 @@ pub mod error;
 pub mod protocol;
 pub mod token_info;
 
-use assert_no_alloc::assert_no_alloc;
 use async_trait::async_trait;
 use solana_account::Account;
 use solana_instruction::Instruction;

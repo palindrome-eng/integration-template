@@ -19,7 +19,7 @@ mod test_construction {
     use titan_integration_template::account_caching::rpc_cache::RpcClientCache;
     use titan_integration_template::trading_venue::{QuoteRequest, SwapType};
     use titan_integration_template::{
-        example::RaydiumAmmVenue,
+        reflect_whitelabel::ReflectWhitelabelVenue,
         trading_venue::{FromAccount, TradingVenue},
     };
 
@@ -29,70 +29,32 @@ mod test_construction {
     #[global_allocator]
     static A: AllocDisabler = AllocDisabler;
 
-    /// Initialize logging for test output.
-    ///
-    /// Having logging enabled is extremely helpful when debugging state-loading
-    /// issues or boundary failures during venue development.
     fn init_test_logger() {
+        let _ = dotenvy::dotenv();
         let _ = env_logger::builder().is_test(true).try_init();
     }
 
-    /// Ensure that the venue can:
-    /// - Build from a raw on-chain account,
-    /// - Perform a state update using the caching layer,
-    /// - Report valid token metadata,
-    /// - Calculate valid quoting boundaries,
-    /// - Return nonzero, liquidity-supported quotes at both boundary edges.
-    ///
     #[rstest]
     #[tokio::test]
-    #[case("Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw")] // Example Raydium pool
-    async fn test_construction(#[case] amm_key: String) {
+    #[case("9GKYXhPf7XF2yVHRwzVWpeLxRJszp4Jf7zF19hbfE1Ah")]
+    async fn test_construction(#[case] proxy_state_key: String) {
         init_test_logger();
 
-        //
-        // Prepare inputs
-        //
-        let amm_key = Pubkey::from_str(&amm_key).expect("Invalid test pubkey");
-
-        let rpc_url =
-            env::var("SOLANA_RPC_URL").expect("SOLANA_RPC_URL must be set for integration tests");
+        let proxy_state_key = Pubkey::from_str(&proxy_state_key).expect("Invalid test pubkey");
+        let rpc_url = env::var("SOLANA_RPC_URL").expect("SOLANA_RPC_URL must be set");
         let rpc = RpcClient::new(rpc_url);
 
-        //
-        // Fetch the venue’s account and construct the venue
-        //
-        let venue_account = rpc
-            .get_account(&amm_key)
-            .await
-            .expect("Failed to fetch AMM account");
+        let venue_account = rpc.get_account(&proxy_state_key).await.unwrap();
+        let mut venue = ReflectWhitelabelVenue::from_account(&proxy_state_key, &venue_account).unwrap();
 
-        let mut venue = RaydiumAmmVenue::from_account(&amm_key, &venue_account)
-            .expect("Failed to construct venue from account");
-
-        //
-        // Load on-chain state using the caching layer
-        //
         let cache = RpcClientCache::new(rpc);
-        venue
-            .update_state(&cache)
-            .await
-            .expect("Venue state update failed");
+        venue.update_state(&cache).await.unwrap();
 
-        //
-        // Validate token metadata
-        //
         let token_info = venue.get_token_info();
         log::info!("Loaded token info: {:#?}", token_info);
         assert!(token_info.len() > 0);
-
-        // Raydium AMMs always have 2 tokens.
         assert_eq!(token_info.len(), 2);
 
-        //
-        // 5. For each direction (token0 → token1, token1 → token0)
-        //    validate quoting boundaries and quote correctness.
-        //
         for (input_idx, output_idx) in [(0, 1), (1, 0)] {
             log::info!("Checking bounds for pair ({}, {})", input_idx, output_idx);
 

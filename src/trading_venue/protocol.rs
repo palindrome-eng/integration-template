@@ -17,15 +17,16 @@ use std::fmt::Display;
 ///
 /// Protocols included here:
 /// - `YourPoolProtocol`: Example/custom protocol placeholder.
-/// - `RaydiumAMM`: Raydium’s constant-product AMM on Solana.
+/// - `ReflectWhitelabel`: Reflect's whitelabel stablecoin wrap/unwrap protocol.
 #[derive(Debug, Copy, Clone)]
 pub enum PoolProtocol {
     /// Example/custom protocol — integrators should rename or replace this
     /// with their own protocol name.
     YourPoolProtocol,
 
-    /// Raydium’s AMM (x*y=k) pools on Solana.
-    RaydiumAMM,
+    /// Reflect's whitelabel stablecoin wrap/unwrap protocol.
+    /// Allows wrapping USDC+ into branded tokens and unwrapping back.
+    ReflectWhitelabel,
 }
 
 impl Display for PoolProtocol {
@@ -45,7 +46,7 @@ impl From<PoolProtocol> for String {
     fn from(protocol: PoolProtocol) -> Self {
         match protocol {
             PoolProtocol::YourPoolProtocol => "YourPoolProtocol".to_string(),
-            PoolProtocol::RaydiumAMM => "RaydiumAMM".to_string(),
+            PoolProtocol::ReflectWhitelabel => "ReflectWhitelabel".to_string(),
         }
     }
 }

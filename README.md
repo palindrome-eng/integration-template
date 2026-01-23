@@ -1,6 +1,6 @@
 # Titan AMM Integration Template
 
-A reference implementation and test suite for integrating AMMs, CLMMs, and proprietary liquidity engines with Titan’s unified routing layer.
+A reference implementation and test suite for integrating AMMs, CLMMs, and proprietary liquidity engines with Titan's unified routing layer.
 
 ## Overview
 

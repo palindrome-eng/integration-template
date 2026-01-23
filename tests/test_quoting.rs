@@ -22,7 +22,7 @@ mod simulations {
     use solana_compute_budget::compute_budget::ComputeBudget;
     use solana_program::native_token::LAMPORTS_PER_SOL;
     use solana_program_pack::Pack;
-    use solana_pubkey::{Pubkey, pubkey};
+    use solana_pubkey::Pubkey;
     use solana_sdk::signature::Keypair;
     use solana_sdk::signer::Signer;
     use solana_sysvar::clock::{self, Clock};
@@ -35,48 +35,28 @@ mod simulations {
 
     use std::env;
 
-    use titan_integration_template::example::RAYDIUM_AMM_PROGRAM_ID;
+    use titan_integration_template::reflect_whitelabel::REFLECT_PROXY_PROGRAM_ID;
     use titan_integration_template::trading_venue::SwapType;
 
     use titan_integration_template::{
-        account_caching::AccountsCache, example::RaydiumAmmVenue, trading_venue::QuoteRequest,
+        account_caching::AccountsCache, reflect_whitelabel::ReflectWhitelabelVenue, trading_venue::QuoteRequest,
     };
     use titan_integration_template::{
         account_caching::rpc_cache::RpcClientCache,
         trading_venue::{FromAccount, TradingVenue, error::TradingVenueError},
     };
 
-    /// Initialize logging for test diagnostics.
     fn init_test_logger() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = dotenvy::dotenv();
+        let _ = env_logger::builder().is_test(false).try_init();
     }
 
-    /// Creates a new LiteSVM instance configured with:
-    /// - Necessary helper programs loaded from `programs/`
-    /// - A funded system account for signing transactions
-    ///
-    /// Integrators should update the programs loaded here for their own tests.
     pub fn setup_litesvm() -> (LiteSVM, Keypair) {
         let mut litesvm = LiteSVM::new().with_compute_budget(ComputeBudget {
             compute_unit_limit: 1_400_000,
             ..Default::default()
         });
 
-        // These two programs appear to be dependencies required by Raydium
-        // CLMM math or helper operations.
-        let spl_calc_program = pubkey!("sspUE1vrh7xRoXxGsg7vR1zde2WdGtJRbyK9uRumBDy");
-        let spl_calc_path = format!("programs/{}.so", spl_calc_program);
-        litesvm
-            .add_program_from_file(spl_calc_program, spl_calc_path)
-            .unwrap();
-
-        let spl_calc_program_2 = pubkey!("ssmbu3KZxgonUtjEMCKspZzxvUQCxAFnyh1rcHUeEDo");
-        let spl_calc_path_2 = format!("programs/{}.so", spl_calc_program_2);
-        litesvm
-            .add_program_from_file(spl_calc_program_2, spl_calc_path_2)
-            .unwrap();
-
-        // Create a funded user wallet.
         let keypair = Keypair::new();
         let account = Account {
             lamports: 10_000 * LAMPORTS_PER_SOL,
@@ -92,8 +72,6 @@ mod simulations {
         (litesvm, keypair)
     }
 
-    /// Simulate a swap using LiteSVM and return the output amount of token B.
-    /// This should give the true on-chain output for that swap.
     async fn sim_quote_request(
         venue: &dyn TradingVenue,
         cache: &dyn AccountsCache,
@@ -103,7 +81,6 @@ mod simulations {
     ) -> u64 {
         let tradable_mints = venue.get_token_info();
 
-        // Identify which token is A and which is B (depending on swap direction)
         let idx_0 = tradable_mints
             .iter()
             .position(|x| x.pubkey == request.input_mint)
@@ -130,20 +107,14 @@ mod simulations {
             &token_b_program,
         );
 
-        //
-        // Create synthetic token accounts inside the simulator
-        //
-
-        // Token A account (source)
         let mut account_a = Account::new(LAMPORTS_PER_SOL, TokenAccount::LEN, &spl_token::ID);
         let mut account_a_data = TokenAccount::default();
         account_a_data.mint = token_a;
         account_a_data.owner = keypair.pubkey();
         account_a_data.state = AccountState::Initialized;
-        account_a_data.amount = u64::MAX; // ensure "infinite" input
+        account_a_data.amount = u64::MAX;
         account_a_data.pack_into_slice(account_a.data_as_mut_slice());
 
-        // Token B account (destination)
         let mut account_b = Account::new(LAMPORTS_PER_SOL, TokenAccount::LEN, &spl_token::ID);
         let mut account_b_data = TokenAccount::default();
         account_b_data.mint = token_b;
@@ -152,18 +123,13 @@ mod simulations {
         account_b_data.amount = 0;
         account_b_data.pack_into_slice(account_b.data_as_mut_slice());
 
-        // Load accounts into LiteSVM
         litesvm.set_account(token_account_a, account_a).unwrap();
         litesvm.set_account(token_account_b, account_b).unwrap();
 
-        //
-        // Build the swap instruction
-        //
         let ix = venue
             .generate_swap_instruction(request, keypair.pubkey())
             .unwrap();
 
-        // Load all instruction accounts into SVM (except executable ones already present)
         let pks: Vec<Pubkey> = ix.accounts.iter().map(|acc| acc.pubkey).collect();
         let accounts_to_load = cache.get_accounts(&pks).await.unwrap();
         for (account, key) in accounts_to_load.iter().zip(pks) {
@@ -175,9 +141,6 @@ mod simulations {
             }
         }
 
-        //
-        // Execute swap inside the SIM
-        //
         let blockhash = litesvm.latest_blockhash();
         let tx = Transaction::new_signed_with_payer(
             &[ix],
@@ -186,11 +149,14 @@ mod simulations {
             blockhash,
         );
 
+        log::debug!(
+            "Sending transaction with {} instructions and with blockhash: {}",
+            tx.message.instructions.len(),
+            blockhash
+        );
+
         litesvm.send_transaction(tx).unwrap();
 
-        //
-        // Read output account and extract the final token amount
-        //
         let account_b = litesvm.get_account(&token_account_b).unwrap();
         let post_b = TokenAccount::unpack_from_slice(&account_b.data)
             .expect("Failed to unpack token B account");
@@ -214,38 +180,29 @@ mod simulations {
         (log_val.exp() as u64).clamp(lo, hi)
     }
 
-    // -------------------------------------------------------------------------
-    // Test 1: check boundary values in simulation
-    // -------------------------------------------------------------------------
-
     #[rstest]
     #[tokio::test]
-    #[case("Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw")]
-    async fn test_bound_simulation(#[case] amm_key: Pubkey) {
+    #[case("9GKYXhPf7XF2yVHRwzVWpeLxRJszp4Jf7zF19hbfE1Ah")]
+    async fn test_bound_simulation(#[case] proxy_state_key: Pubkey) {
         init_test_logger();
 
-        // Fetch live pool data from RPC
         let rpc_url = env::var("SOLANA_RPC_URL").unwrap();
         let rpc = RpcClient::new(rpc_url);
-        let venue_account = rpc.get_account(&amm_key).await.unwrap();
+        let venue_account = rpc.get_account(&proxy_state_key).await.unwrap();
 
-        // Build venue + load pool state
         let cache = RpcClientCache::new(rpc);
-        let mut venue = RaydiumAmmVenue::from_account(&amm_key, &venue_account).unwrap();
+        let mut venue = ReflectWhitelabelVenue::from_account(&proxy_state_key, &venue_account).unwrap();
         venue.update_state(&cache).await.unwrap();
 
-        // Setup simulation VM
         let (mut litesvm, keypair) = setup_litesvm();
 
-        // Load Raydium AMM program binary
         litesvm
             .add_program_from_file(
-                RAYDIUM_AMM_PROGRAM_ID,
-                "programs/675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8.so",
+                REFLECT_PROXY_PROGRAM_ID,
+                "reflect-proxy-program/target/deploy/reflect_companion_program.so",
             )
             .unwrap();
 
-        // Sync sysvar clock to real network
         let latest_clock = cache.get_account(&clock::ID).await.unwrap();
         let latest_clock: Clock = latest_clock
             .as_ref()
@@ -256,13 +213,9 @@ mod simulations {
 
         litesvm.set_sysvar::<Clock>(&latest_clock);
 
-        // Ensure valid token set
         let tradable_mints = venue.get_token_info();
         assert_eq!(tradable_mints.len(), 2);
 
-        //
-        // For each swap direction, verify that boundary quotes match simulation.
-        //
         for (in_idx, out_idx) in [(0, 1), (1, 0)] {
             let (lower, upper) = venue.bounds(in_idx as u8, out_idx as u8).unwrap();
 
@@ -292,35 +245,28 @@ mod simulations {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Test 2: Random sampling simulation
-    // -------------------------------------------------------------------------
-
     #[rstest]
     #[tokio::test]
-    #[case("Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw")]
-    async fn test_random_samples(#[case] amm_key: Pubkey) {
+    #[case("9GKYXhPf7XF2yVHRwzVWpeLxRJszp4Jf7zF19hbfE1Ah")]
+    async fn test_random_samples(#[case] proxy_state_key: Pubkey) {
         init_test_logger();
 
-        // Fetch venue state from RPC
         let rpc_url = env::var("SOLANA_RPC_URL").unwrap();
         let rpc = RpcClient::new(rpc_url);
-        let venue_account = rpc.get_account(&amm_key).await.unwrap();
+        let venue_account = rpc.get_account(&proxy_state_key).await.unwrap();
 
         let cache = RpcClientCache::new(rpc);
-        let mut venue = RaydiumAmmVenue::from_account(&amm_key, &venue_account).unwrap();
+        let mut venue = ReflectWhitelabelVenue::from_account(&proxy_state_key, &venue_account).unwrap();
         venue.update_state(&cache).await.unwrap();
 
-        // Setup simulation VM
         let (mut litesvm, keypair) = setup_litesvm();
         litesvm
             .add_program_from_file(
-                RAYDIUM_AMM_PROGRAM_ID,
-                "programs/675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8.so",
+                REFLECT_PROXY_PROGRAM_ID,
+                "reflect-proxy-program/target/deploy/reflect_companion_program.so",
             )
             .unwrap();
 
-        // Sync sysvar clock
         let latest_clock = cache.get_account(&clock::ID).await.unwrap();
         let latest_clock: Clock = latest_clock
             .as_ref()
@@ -330,10 +276,6 @@ mod simulations {
             .unwrap();
         litesvm.set_sysvar::<Clock>(&latest_clock);
 
-        //
-        // For each direction, randomly sample the entire valid quoting domain and
-        // ensure that the quoted amount matches the simulated amount.
-        //
         for (in_idx, out_idx) in [(0, 1), (1, 0)] {
             let (lb, ub) = venue.bounds(in_idx, out_idx).unwrap();
 
@@ -364,58 +306,26 @@ mod simulations {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Test 3: AMM Monotonicity
-    // -------------------------------------------------------------------------
-
     #[rstest]
     #[tokio::test]
-    #[case("Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw")] // Example Raydium pool
-    async fn test_monotone(#[case] amm_key: String) -> () {
+    #[case("9GKYXhPf7XF2yVHRwzVWpeLxRJszp4Jf7zF19hbfE1Ah")]
+    async fn test_monotone(#[case] proxy_state_key: String) -> () {
         init_test_logger();
 
-        //
-        // Prepare inputs
-        //
-        let amm_key = Pubkey::from_str(&amm_key).expect("Invalid test pubkey");
-
-        let rpc_url =
-            env::var("SOLANA_RPC_URL").expect("SOLANA_RPC_URL must be set for integration tests");
+        let proxy_state_key = Pubkey::from_str(&proxy_state_key).expect("Invalid test pubkey");
+        let rpc_url = env::var("SOLANA_RPC_URL").expect("SOLANA_RPC_URL must be set");
         let rpc = RpcClient::new(rpc_url);
 
-        //
-        // Fetch the venue’s account and construct the venue
-        //
-        let venue_account = rpc
-            .get_account(&amm_key)
-            .await
-            .expect("Failed to fetch AMM account");
+        let venue_account = rpc.get_account(&proxy_state_key).await.unwrap();
+        let mut venue = ReflectWhitelabelVenue::from_account(&proxy_state_key, &venue_account).unwrap();
 
-        let mut venue = RaydiumAmmVenue::from_account(&amm_key, &venue_account)
-            .expect("Failed to construct venue from account");
-
-        //
-        // Load on-chain state using the caching layer
-        //
         let cache = RpcClientCache::new(rpc);
-        venue
-            .update_state(&cache)
-            .await
-            .expect("Venue state update failed");
+        venue.update_state(&cache).await.unwrap();
 
-        //
-        // Validate token metadata
-        //
         let token_info = venue.get_token_info();
         log::debug!("Loaded token info: {:#?}", token_info);
-
-        // Raydium AMMs always have 2 tokens.
         assert_eq!(token_info.len(), 2);
 
-        //
-        // For each direction (token0 → token1, token1 → token0)
-        // is monotone increasing.
-        //
         for (in_idx, out_idx) in [(0, 1), (1, 0)] {
             let (lb, ub) = venue.bounds(in_idx, out_idx).unwrap();
             let mut test_amounts = Vec::with_capacity(50);
@@ -453,58 +363,26 @@ mod simulations {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Test 4: Quoting speed
-    // -------------------------------------------------------------------------
-
     #[rstest]
     #[tokio::test]
-    #[case("Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw", 10_000)] // Example Raydium pool
-    async fn test_quoting_speed(#[case] amm_key: String, #[case] iterations: usize) -> () {
+    #[case("9GKYXhPf7XF2yVHRwzVWpeLxRJszp4Jf7zF19hbfE1Ah", 10_000)]
+    async fn test_quoting_speed(#[case] proxy_state_key: String, #[case] iterations: usize) -> () {
         init_test_logger();
 
-        //
-        // Prepare inputs
-        //
-        let amm_key = Pubkey::from_str(&amm_key).expect("Invalid test pubkey");
-
-        let rpc_url =
-            env::var("SOLANA_RPC_URL").expect("SOLANA_RPC_URL must be set for integration tests");
+        let proxy_state_key = Pubkey::from_str(&proxy_state_key).expect("Invalid test pubkey");
+        let rpc_url = env::var("SOLANA_RPC_URL").expect("SOLANA_RPC_URL must be set");
         let rpc = RpcClient::new(rpc_url);
 
-        //
-        // Fetch the venue’s account and construct the venue
-        //
-        let venue_account = rpc
-            .get_account(&amm_key)
-            .await
-            .expect("Failed to fetch AMM account");
+        let venue_account = rpc.get_account(&proxy_state_key).await.unwrap();
+        let mut venue = ReflectWhitelabelVenue::from_account(&proxy_state_key, &venue_account).unwrap();
 
-        let mut venue = RaydiumAmmVenue::from_account(&amm_key, &venue_account)
-            .expect("Failed to construct venue from account");
-
-        //
-        // Load on-chain state using the caching layer
-        //
         let cache = RpcClientCache::new(rpc);
-        venue
-            .update_state(&cache)
-            .await
-            .expect("Venue state update failed");
+        venue.update_state(&cache).await.unwrap();
 
-        //
-        // Validate token metadata
-        //
         let token_info = venue.get_token_info();
         log::debug!("Loaded token info: {:#?}", token_info);
-
-        // Raydium AMMs always have 2 tokens.
         assert_eq!(token_info.len(), 2);
 
-        //
-        // For each direction (token0 → token1, token1 → token0)
-        // verify quoting speed requirements are met.
-        //
         for (in_idx, out_idx) in [(0, 1), (1, 0)] {
             let input_mint = token_info[in_idx as usize].pubkey;
             let output_mint = token_info[out_idx as usize].pubkey;
