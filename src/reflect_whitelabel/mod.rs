@@ -4,6 +4,8 @@
 //! stablecoin system. Users can wrap USDC+ (stablecoin) into branded tokens
 //! and unwrap branded tokens back to USDC+.
 
+mod instructions;
+
 use ahash::HashSet;
 use async_trait::async_trait;
 use solana_account::Account;
@@ -526,7 +528,7 @@ impl ReflectWhitelabelVenue {
         branded_user_token_account: Pubkey,
         amount: u64,
     ) -> Result<Instruction, TradingVenueError> {
-        use reflect_proxy_program_client::instructions::{Wrap, WrapInstructionArgs};
+        use instructions::{Wrap, WrapInstructionArgs};
 
         let wrap = Wrap {
             user,
@@ -554,7 +556,7 @@ impl ReflectWhitelabelVenue {
         branded_user_token_account: Pubkey,
         amount: u64,
     ) -> Result<Instruction, TradingVenueError> {
-        use reflect_proxy_program_client::instructions::{Unwrap, UnwrapInstructionArgs};
+        use instructions::{Unwrap, UnwrapInstructionArgs};
 
         let unwrap = Unwrap {
             user,

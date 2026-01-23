@@ -46,4 +46,3 @@ litesvm =  { version = "^0.6.1"}
 rand = "0.9.2"
 assert_no_alloc = { version = "1.1.2", default-features = false }
 dotenvy = "0.15"
-reflect-proxy-program-client = { path = "reflect-proxy-program/sdk/rust" }

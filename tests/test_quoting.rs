@@ -127,7 +127,7 @@ mod simulations {
         litesvm.set_account(token_account_b, account_b).unwrap();
 
         let ix = venue
-            .generate_swap_instruction(request, keypair.pubkey())
+            .generate_swap_instruction(request.clone(), keypair.pubkey())
             .unwrap();
 
         let pks: Vec<Pubkey> = ix.accounts.iter().map(|acc| acc.pubkey).collect();
@@ -150,8 +150,9 @@ mod simulations {
         );
 
         log::debug!(
-            "Sending transaction with {} instructions and with blockhash: {}",
+            "Sending transaction with {} instruction with amount: {} and with blockhash: {}",
             tx.message.instructions.len(),
+            request.amount.clone(),
             blockhash
         );
 
@@ -199,7 +200,7 @@ mod simulations {
         litesvm
             .add_program_from_file(
                 REFLECT_PROXY_PROGRAM_ID,
-                "reflect-proxy-program/target/deploy/reflect_companion_program.so",
+                "tests/programs/reflect_companion_program.so",
             )
             .unwrap();
 
@@ -263,7 +264,7 @@ mod simulations {
         litesvm
             .add_program_from_file(
                 REFLECT_PROXY_PROGRAM_ID,
-                "reflect-proxy-program/target/deploy/reflect_companion_program.so",
+                "tests/programs/reflect_companion_program.so",
             )
             .unwrap();
 
