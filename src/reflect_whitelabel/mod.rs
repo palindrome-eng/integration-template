@@ -5,6 +5,7 @@
 //! and unwrap branded tokens back to USDC+.
 
 mod instructions;
+pub mod oracle;
 
 use ahash::HashSet;
 use async_trait::async_trait;
@@ -13,6 +14,8 @@ use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token_2022::{extension::StateWithExtensions, state::Mint};
+
+use oracle::{div_oracle, mul_oracle, real_price_f64, OracleLeg};
 
 use crate::{
     account_caching::AccountsCache,
@@ -55,17 +58,17 @@ fn derive_asset_pda(stablecoin_mint: &Pubkey) -> Pubkey {
     .0
 }
 
-/// Virtual shares offset for ERC4626-style inflation attack mitigation.
-const VIRTUAL_SHARES: u64 = 1_000_000;
-
-/// Virtual USDC assets offset for ERC4626-style inflation attack mitigation.
-const VIRTUAL_ASSETS_USDC: u64 = 1_000_000;
+/// Virtual accounting offset for ERC4626-style inflation-attack mitigation.
+///
+/// The on-chain program computes this dynamically as `10^branded_decimals`
+/// (e.g. `1_000_000` for a 6-decimal token). It is used as both the virtual
+/// share offset and the virtual asset offset.
+fn virtual_offset(branded_decimals: u8) -> u128 {
+    10u128.pow(branded_decimals as u32)
+}
 
 /// On-chain ProxyState size: 32 + 32 + 2 + 8 + 8 + 32 + 1 = 115 bytes
 const PROXY_STATE_LEN: usize = 115;
-
-/// Oracle account size: slot(8) + price(8) + precision(1) = 17 bytes
-const ORACLE_LEN: usize = 17;
 
 /// Parsed proxy state data from on-chain account.
 /// This matches the on-chain layout exactly:
@@ -157,10 +160,18 @@ pub struct ReflectWhitelabelVenue {
     pub branded_supply: u64,
     /// Current stablecoin balance in the vault.
     pub vault_balance: u64,
-    /// Oracle price (stablecoin per USDC, scaled by precision).
-    pub oracle_price: u64,
-    /// Oracle precision (decimal places).
-    pub oracle_precision: u8,
+    /// Composed oracle price for the asset's chain. `oracle_price * 10^oracle_exponent`
+    /// is the real USDC value of one stablecoin (USDC+) atom.
+    pub oracle_price: u128,
+    /// Signed exponent accompanying [`Self::oracle_price`] (from the composed chain).
+    pub oracle_exponent: i32,
+    /// Decimals of the branded mint, used for the virtual accounting offset.
+    pub branded_decimals: u8,
+    /// Parsed oracle-chain legs from the `Asset` account (leg 0 first).
+    oracle_legs: Vec<OracleLeg>,
+    /// Trailing oracle-leg accounts (legs 1..) appended to wrap/unwrap after
+    /// `stablecoin_mint`. Empty for single-leg assets.
+    extra_oracles: Vec<Pubkey>,
     /// Set of pubkeys required for state updates.
     required_state_pubkeys: HashSet<Pubkey>,
     /// Whether the venue has been fully initialized.
@@ -211,7 +222,10 @@ impl FromAccount for ReflectWhitelabelVenue {
             branded_supply: 0,
             vault_balance: 0,
             oracle_price: 0,
-            oracle_precision: 6, // Default to 6 decimals
+            oracle_exponent: 0,
+            branded_decimals: 6, // Default to 6 decimals until state is loaded.
+            oracle_legs: Vec::new(),
+            extra_oracles: Vec::new(),
             required_state_pubkeys,
             found_all_pubkeys: false,
             token_info: Vec::new(),
@@ -267,19 +281,22 @@ impl TradingVenue for ReflectWhitelabelVenue {
     }
 
     async fn update_state(&mut self, cache: &dyn AccountsCache) -> Result<(), TradingVenueError> {
+        // Phase 1: proxy state, mints, vault, and the Asset registry account. The
+        // oracle-chain legs live inside the Asset, so their accounts are only known
+        // after this fetch (phase 2 below).
         let accounts_pubkeys = vec![
             self.keys.proxy_state,
             self.keys.branded_mint,
             self.keys.stablecoin_mint,
             self.keys.stablecoin_vault,
-            self.keys.oracle,
+            self.keys.asset,
         ];
 
         self.required_state_pubkeys.extend(&accounts_pubkeys);
 
         let accounts = cache.get_accounts(&accounts_pubkeys).await?;
 
-        let [proxy_state_account, branded_mint_account, stablecoin_mint_account, vault_account, oracle_account]: [Option<Account>;
+        let [proxy_state_account, branded_mint_account, stablecoin_mint_account, vault_account, asset_account]: [Option<Account>;
             5] = accounts
             .try_into()
             .map_err(|_| TradingVenueError::FailedToFetchMultipleAccountData)?;
@@ -298,6 +315,7 @@ impl TradingVenue for ReflectWhitelabelVenue {
                 TradingVenueError::DeserializationFailed("Failed to parse branded mint".into())
             })?;
             self.branded_supply = mint.base.supply;
+            self.branded_decimals = mint.base.decimals;
         }
 
         if let Some(ref account) = stablecoin_mint_account {
@@ -318,14 +336,30 @@ impl TradingVenue for ReflectWhitelabelVenue {
             }
         }
 
-        if let Some(ref account) = oracle_account {
-            if account.data.len() >= ORACLE_LEN {
-                let price_bytes: [u8; 8] = account.data[8..16]
-                    .try_into()
-                    .map_err(|_| TradingVenueError::DeserializationFailed("oracle price".into()))?;
-                self.oracle_price = u64::from_le_bytes(price_bytes);
-                self.oracle_precision = account.data[16];
+        // Parse the Asset's oracle chain and resolve the composed price.
+        if let Some(ref account) = asset_account {
+            let legs = oracle::parse_asset_legs(&account.data)?;
+            let leg_accounts = oracle::leg_oracle_accounts(&legs);
+
+            // Leg 0 is the primary oracle the instruction passes as `oracle`; the
+            // rest form the `extra_oracles` tail.
+            self.keys.oracle = leg_accounts[0];
+            self.extra_oracles = leg_accounts[1..].to_vec();
+            self.oracle_legs = legs.clone();
+            self.required_state_pubkeys.extend(leg_accounts.iter().copied());
+
+            // Phase 2: fetch each leg's oracle account and compose the chain.
+            let fetched = cache.get_accounts(&leg_accounts).await?;
+            let mut resolved = Vec::with_capacity(leg_accounts.len());
+            for (leg_pubkey, maybe_account) in leg_accounts.iter().zip(fetched.into_iter()) {
+                let account = maybe_account
+                    .ok_or_else(|| TradingVenueError::NoAccountFound((*leg_pubkey).into()))?;
+                resolved.push((account.owner, account.data));
             }
+
+            let composed = oracle::resolve_price(&legs, &resolved)?;
+            self.oracle_price = composed.price;
+            self.oracle_exponent = composed.exponent;
         }
 
         if let (Some(stablecoin_account), Some(branded_account)) =
@@ -445,10 +479,8 @@ impl ReflectWhitelabelVenue {
     /// Simulate the crank operation that happens on-chain before wrap/unwrap.
     /// Returns the post-crank principal value.
     fn simulate_crank(&self) -> Result<u64, TradingVenueError> {
-        let vault_usdc_value = (self.vault_balance as u128)
-            .checked_mul(self.oracle_price as u128)
-            .and_then(|x| x.checked_div(10u128.pow(self.oracle_precision as u32)))
-            .ok_or_else(|| TradingVenueError::MathError("overflow in vault value".into()))?;
+        let vault_usdc_value =
+            mul_oracle(self.vault_balance as u128, self.oracle_price, self.oracle_exponent)?;
 
         let vault_usdc_value = u64::try_from(vault_usdc_value)
             .map_err(|_| TradingVenueError::MathError("vault value overflow u64".into()))?;
@@ -489,12 +521,13 @@ impl ReflectWhitelabelVenue {
     fn spot_price(&self, is_wrap: bool) -> Result<f64, TradingVenueError> {
         let post_crank_principal = self.simulate_crank()?;
 
-        let supply_with_virtual = self.branded_supply as f64 + VIRTUAL_SHARES as f64;
-        let principal_with_virtual = post_crank_principal as f64 + VIRTUAL_ASSETS_USDC as f64;
-        let oracle_scale = 10f64.powi(self.oracle_precision as i32);
-        let oracle_price = self.oracle_price as f64;
+        let voff = virtual_offset(self.branded_decimals) as f64;
+        let supply_with_virtual = self.branded_supply as f64 + voff;
+        let principal_with_virtual = post_crank_principal as f64 + voff;
+        // Real USDC value of one stablecoin (USDC+) atom = price * 10^exponent.
+        let real_price = real_price_f64(self.oracle_price, self.oracle_exponent);
 
-        if oracle_price <= 0.0 || oracle_scale <= 0.0 || principal_with_virtual <= 0.0 {
+        if real_price <= 0.0 || principal_with_virtual <= 0.0 {
             return Err(TradingVenueError::MathError(
                 "spot price is undefined for current venue state".into(),
             ));
@@ -502,10 +535,10 @@ impl ReflectWhitelabelVenue {
 
         let price = if is_wrap {
             // branded out per stablecoin in
-            (oracle_price / oracle_scale) * (supply_with_virtual / principal_with_virtual)
+            real_price * (supply_with_virtual / principal_with_virtual)
         } else {
             // stablecoin out per branded in
-            (principal_with_virtual / supply_with_virtual) * (oracle_scale / oracle_price)
+            (principal_with_virtual / supply_with_virtual) / real_price
         };
 
         Ok(price)
@@ -515,10 +548,8 @@ impl ReflectWhitelabelVenue {
     fn calculate_wrap_output(&self, stablecoin_amount: u64) -> Result<u64, TradingVenueError> {
         let post_crank_principal = self.simulate_crank()?;
 
-        let input_usdc_value = (stablecoin_amount as u128)
-            .checked_mul(self.oracle_price as u128)
-            .and_then(|x| x.checked_div(10u128.pow(self.oracle_precision as u32)))
-            .ok_or_else(|| TradingVenueError::MathError("overflow in wrap calculation".into()))?;
+        let input_usdc_value =
+            mul_oracle(stablecoin_amount as u128, self.oracle_price, self.oracle_exponent)?;
 
         let input_usdc_value_u64 = u64::try_from(input_usdc_value)
             .map_err(|_| TradingVenueError::MathError("input USDC value overflow u64".into()))?;
@@ -528,11 +559,11 @@ impl ReflectWhitelabelVenue {
             .ok_or_else(|| TradingVenueError::MathError("principal addition would overflow".into()))?;
 
         let supply_with_virtual = (self.branded_supply as u128)
-            .checked_add(VIRTUAL_SHARES as u128)
+            .checked_add(virtual_offset(self.branded_decimals))
             .ok_or_else(|| TradingVenueError::MathError("overflow in supply".into()))?;
 
         let principal_with_virtual = (post_crank_principal as u128)
-            .checked_add(VIRTUAL_ASSETS_USDC as u128)
+            .checked_add(virtual_offset(self.branded_decimals))
             .ok_or_else(|| TradingVenueError::MathError("overflow in principal".into()))?;
 
         let output = input_usdc_value
@@ -555,11 +586,11 @@ impl ReflectWhitelabelVenue {
         let post_crank_principal = self.simulate_crank()?;
 
         let supply_with_virtual = (self.branded_supply as u128)
-            .checked_add(VIRTUAL_SHARES as u128)
+            .checked_add(virtual_offset(self.branded_decimals))
             .ok_or_else(|| TradingVenueError::MathError("overflow in supply".into()))?;
 
         let principal_with_virtual = (post_crank_principal as u128)
-            .checked_add(VIRTUAL_ASSETS_USDC as u128)
+            .checked_add(virtual_offset(self.branded_decimals))
             .ok_or_else(|| TradingVenueError::MathError("overflow in principal".into()))?;
 
         // Calculate USDC value of user's share
@@ -577,12 +608,8 @@ impl ReflectWhitelabelVenue {
             .checked_sub(user_share_usdc_value_u64)
             .ok_or_else(|| TradingVenueError::MathError("principal subtraction would underflow".into()))?;
 
-        let stablecoin_out = user_share_usdc_value
-            .checked_mul(10u128.pow(self.oracle_precision as u32))
-            .and_then(|x| x.checked_div(self.oracle_price as u128))
-            .ok_or_else(|| {
-                TradingVenueError::MathError("overflow in unwrap output calculation".into())
-            })?;
+        let stablecoin_out =
+            div_oracle(user_share_usdc_value, self.oracle_price, self.oracle_exponent)?;
 
         u64::try_from(stablecoin_out)
             .map_err(|_| TradingVenueError::MathError("unwrap output overflow u64".into()))
@@ -608,7 +635,7 @@ impl ReflectWhitelabelVenue {
             asset: self.keys.asset,
             token_program: self.keys.stablecoin_token_program,
             stablecoin_mint: self.keys.stablecoin_mint,
-            extra_oracles: Vec::new(),
+            extra_oracles: self.extra_oracles.clone(),
         };
 
         let args = WrapInstructionArgs {
@@ -639,7 +666,7 @@ impl ReflectWhitelabelVenue {
             asset: self.keys.asset,
             token_program: self.keys.stablecoin_token_program,
             stablecoin_mint: self.keys.stablecoin_mint,
-            extra_oracles: Vec::new(),
+            extra_oracles: self.extra_oracles.clone(),
         };
 
         let args = UnwrapInstructionArgs {
@@ -654,9 +681,17 @@ impl ReflectWhitelabelVenue {
         self.keys.oracle = oracle;
     }
 
-    pub fn set_oracle_price(&mut self, price: u64, precision: u8) {
+    /// Override the composed oracle price. `price * 10^exponent` is the real USDC
+    /// value of one stablecoin (USDC+) atom. Primarily for tests.
+    pub fn set_oracle_price(&mut self, price: u128, exponent: i32) {
         self.oracle_price = price;
-        self.oracle_precision = precision;
+        self.oracle_exponent = exponent;
+    }
+
+    /// Override the branded-mint decimals used for the virtual accounting offset.
+    /// Primarily for tests.
+    pub fn set_branded_decimals(&mut self, decimals: u8) {
+        self.branded_decimals = decimals;
     }
 }
 
@@ -666,7 +701,7 @@ impl AddressLookupTableTrait for ReflectWhitelabelVenue {
         &self,
         _accounts_cache: Option<&dyn AccountsCache>,
     ) -> Result<Vec<Pubkey>, TradingVenueError> {
-        Ok(vec![
+        let mut keys = vec![
             self.keys.proxy_state,
             self.keys.branded_mint,
             self.keys.stablecoin_mint,
@@ -675,7 +710,9 @@ impl AddressLookupTableTrait for ReflectWhitelabelVenue {
             self.keys.asset,
             self.keys.stablecoin_token_program,
             REFLECT_PROXY_PROGRAM_ID,
-        ])
+        ];
+        keys.extend(self.extra_oracles.iter().copied());
+        Ok(keys)
     }
 }
 
