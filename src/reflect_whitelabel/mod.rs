@@ -35,6 +35,26 @@ pub const ORACLE_ID: Pubkey = Pubkey::new_from_array([
     0x20, 0x10, 0x27, 0x35, 0x44, 0xf5, 0xa2, 0xa1,
 ]);
 
+/// PDA seed for the `Asset` registry account (`["asset", stablecoin_mint]`).
+/// The proxy program reads the oracle/feed identity from this account during
+/// wrap/unwrap, so it must be supplied with the swap instruction.
+const ASSET_SEED: &[u8] = b"asset";
+
+/// Minimum slippage bound passed to on-chain wrap/unwrap. The program rejects a
+/// zero minimum (it would disable slippage protection), and rejects zero output
+/// separately, so `1` is the smallest accepted value. Titan enforces real
+/// slippage at the route level.
+const MIN_OUTPUT_TOKENS: u64 = 1;
+
+/// Derive the `Asset` registry PDA for a given stablecoin mint.
+fn derive_asset_pda(stablecoin_mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[ASSET_SEED, stablecoin_mint.as_ref()],
+        &REFLECT_PROXY_PROGRAM_ID,
+    )
+    .0
+}
+
 /// Virtual shares offset for ERC4626-style inflation attack mitigation.
 const VIRTUAL_SHARES: u64 = 1_000_000;
 
@@ -105,6 +125,9 @@ pub struct ReflectWhitelabelKeys {
     pub stablecoin_mint: Pubkey,
     /// The authority of the proxy.
     pub authority: Pubkey,
+    /// The `Asset` registry PDA (`["asset", stablecoin_mint]`). Supplied to
+    /// wrap/unwrap so the program can read the oracle/feed identity.
+    pub asset: Pubkey,
     /// The oracle account for USDC+/USDC price.
     pub oracle: Pubkey,
     /// The token program for the stablecoin.
@@ -164,6 +187,7 @@ impl FromAccount for ReflectWhitelabelVenue {
             branded_mint: proxy_state.branded_mint,
             stablecoin_mint: proxy_state.stablecoin_mint,
             authority: proxy_state.authority,
+            asset: derive_asset_pda(&proxy_state.stablecoin_mint),
             oracle: ORACLE_ID,
             stablecoin_token_program,
             stablecoin_vault,
@@ -176,6 +200,7 @@ impl FromAccount for ReflectWhitelabelVenue {
             keys.stablecoin_mint,
             keys.stablecoin_vault,
             keys.oracle,
+            keys.asset,
         ]);
 
         Ok(Self {
@@ -318,16 +343,6 @@ impl TradingVenue for ReflectWhitelabelVenue {
     }
 
     fn quote(&self, request: QuoteRequest) -> Result<QuoteResult, TradingVenueError> {
-        if request.amount == 0 {
-            return Ok(QuoteResult {
-                input_mint: request.input_mint,
-                output_mint: request.output_mint,
-                amount: 0,
-                expected_output: 0,
-                not_enough_liquidity: false,
-            });
-        }
-
         let is_wrap = request.input_mint == self.keys.stablecoin_mint
             && request.output_mint == self.keys.branded_mint;
         let is_unwrap = request.input_mint == self.keys.branded_mint
@@ -335,6 +350,23 @@ impl TradingVenue for ReflectWhitelabelVenue {
 
         if !is_wrap && !is_unwrap {
             return Err(TradingVenueError::InvalidMint(request.input_mint.into()));
+        }
+
+        // Wrap and unwrap are both linear in the input amount, so the marginal
+        // price `f'(amount)` is constant and equal to the spot price at 0.
+        let price = self.spot_price(is_wrap)?;
+
+        // A zero-input quote produces no output, but Titan still expects the
+        // venue's spot price. See [`QuoteResult::price`].
+        if request.amount == 0 {
+            return Ok(QuoteResult {
+                input_mint: request.input_mint,
+                output_mint: request.output_mint,
+                amount: 0,
+                expected_output: 0,
+                not_enough_liquidity: false,
+                price,
+            });
         }
 
         let expected_output = if is_wrap {
@@ -351,6 +383,7 @@ impl TradingVenue for ReflectWhitelabelVenue {
             amount: request.amount,
             expected_output,
             not_enough_liquidity,
+            price,
         })
     }
 
@@ -442,6 +475,40 @@ impl ReflectWhitelabelVenue {
         self.principal
             .checked_add(generated_principal)
             .ok_or_else(|| TradingVenueError::MathError("overflow in new principal".into()))
+    }
+
+    /// Marginal price (output atoms per input atom) for a wrap or unwrap.
+    ///
+    /// Both `calculate_wrap_output` and `calculate_unwrap_output` are linear in
+    /// the input amount — the post-crank principal, branded supply, and oracle
+    /// price do not depend on the trade size — so `f'(amount)` is constant and
+    /// equals the venue's spot price at `amount == 0`. This satisfies Titan's
+    /// pricing invariants: the output curve is a positive-slope line, hence
+    /// monotone, concave (constant price), and consistent with the realized
+    /// average rate.
+    fn spot_price(&self, is_wrap: bool) -> Result<f64, TradingVenueError> {
+        let post_crank_principal = self.simulate_crank()?;
+
+        let supply_with_virtual = self.branded_supply as f64 + VIRTUAL_SHARES as f64;
+        let principal_with_virtual = post_crank_principal as f64 + VIRTUAL_ASSETS_USDC as f64;
+        let oracle_scale = 10f64.powi(self.oracle_precision as i32);
+        let oracle_price = self.oracle_price as f64;
+
+        if oracle_price <= 0.0 || oracle_scale <= 0.0 || principal_with_virtual <= 0.0 {
+            return Err(TradingVenueError::MathError(
+                "spot price is undefined for current venue state".into(),
+            ));
+        }
+
+        let price = if is_wrap {
+            // branded out per stablecoin in
+            (oracle_price / oracle_scale) * (supply_with_virtual / principal_with_virtual)
+        } else {
+            // stablecoin out per branded in
+            (principal_with_virtual / supply_with_virtual) * (oracle_scale / oracle_price)
+        };
+
+        Ok(price)
     }
 
     /// Calculate branded tokens output for a given stablecoin input (wrap).
@@ -538,12 +605,15 @@ impl ReflectWhitelabelVenue {
             stablecoin_proxy_state_vault: self.keys.stablecoin_vault,
             branded_mint: self.keys.branded_mint,
             oracle: self.keys.oracle,
+            asset: self.keys.asset,
             token_program: self.keys.stablecoin_token_program,
+            stablecoin_mint: self.keys.stablecoin_mint,
+            extra_oracles: Vec::new(),
         };
 
         let args = WrapInstructionArgs {
             amount,
-            min_branded_tokens: 0,
+            min_branded_tokens: MIN_OUTPUT_TOKENS,
         };
 
         Ok(wrap.instruction(args))
@@ -566,12 +636,15 @@ impl ReflectWhitelabelVenue {
             stablecoin_proxy_state_vault: self.keys.stablecoin_vault,
             branded_mint: self.keys.branded_mint,
             oracle: self.keys.oracle,
+            asset: self.keys.asset,
             token_program: self.keys.stablecoin_token_program,
+            stablecoin_mint: self.keys.stablecoin_mint,
+            extra_oracles: Vec::new(),
         };
 
         let args = UnwrapInstructionArgs {
             amount,
-            min_usdc_plus: 0,
+            min_usdc_plus: MIN_OUTPUT_TOKENS,
         };
 
         Ok(unwrap.instruction(args))
@@ -599,8 +672,130 @@ impl AddressLookupTableTrait for ReflectWhitelabelVenue {
             self.keys.stablecoin_mint,
             self.keys.stablecoin_vault,
             self.keys.oracle,
+            self.keys.asset,
             self.keys.stablecoin_token_program,
             REFLECT_PROXY_PROGRAM_ID,
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instructions::{Unwrap, UnwrapInstructionArgs, Wrap, WrapInstructionArgs};
+    use super::*;
+
+    fn pk(byte: u8) -> Pubkey {
+        Pubkey::new_from_array([byte; 32])
+    }
+
+    /// The deployed program (`main`) destructures wrap/unwrap accounts as a fixed
+    /// 10-slot array with `asset` at index 7 and `stablecoin_mint` at index 9,
+    /// followed by an optional oracle-chain tail. Lock that shape in.
+    #[test]
+    fn wrap_instruction_matches_onchain_account_layout() {
+        let wrap = Wrap {
+            user: pk(1),
+            stablecoin_user_token_account: pk(2),
+            branded_user_token_account: pk(3),
+            proxy_state: pk(4),
+            stablecoin_proxy_state_vault: pk(5),
+            branded_mint: pk(6),
+            oracle: pk(7),
+            asset: pk(8),
+            token_program: pk(9),
+            stablecoin_mint: pk(10),
+            extra_oracles: Vec::new(),
+        };
+
+        let ix = wrap.instruction(WrapInstructionArgs {
+            amount: 1_000,
+            min_branded_tokens: MIN_OUTPUT_TOKENS,
+        });
+
+        assert_eq!(ix.program_id, REFLECT_PROXY_PROGRAM_ID);
+        assert_eq!(ix.accounts.len(), 10, "single-leg wrap must pass 10 accounts");
+
+        // Order and mutability that the program's `WrapAccounts` destructure expects.
+        assert_eq!(ix.accounts[0].pubkey, pk(1));
+        assert!(ix.accounts[0].is_signer && !ix.accounts[0].is_writable);
+        assert!(ix.accounts[3].is_writable, "proxy_state must be mutable");
+        assert!(ix.accounts[5].is_writable, "branded_mint must be mutable");
+        assert_eq!(ix.accounts[6].pubkey, pk(7)); // oracle
+        assert_eq!(ix.accounts[7].pubkey, pk(8)); // asset
+        assert!(!ix.accounts[7].is_writable);
+        assert_eq!(ix.accounts[8].pubkey, pk(9)); // token_program
+        assert_eq!(ix.accounts[9].pubkey, pk(10)); // stablecoin_mint
+
+        // discriminator (1) + amount (8) + min (8)
+        assert_eq!(ix.data[0], 1);
+        assert_eq!(ix.data.len(), 17);
+        let min = u64::from_le_bytes(ix.data[9..17].try_into().unwrap());
+        assert!(min > 0, "on-chain rejects a zero minimum");
+    }
+
+    #[test]
+    fn unwrap_instruction_matches_onchain_account_layout() {
+        let unwrap = Unwrap {
+            user: pk(1),
+            stablecoin_user_token_account: pk(2),
+            branded_user_token_account: pk(3),
+            proxy_state: pk(4),
+            stablecoin_proxy_state_vault: pk(5),
+            branded_mint: pk(6),
+            oracle: pk(7),
+            asset: pk(8),
+            token_program: pk(9),
+            stablecoin_mint: pk(10),
+            extra_oracles: Vec::new(),
+        };
+
+        let ix = unwrap.instruction(UnwrapInstructionArgs {
+            amount: 1_000,
+            min_usdc_plus: MIN_OUTPUT_TOKENS,
+        });
+
+        assert_eq!(ix.accounts.len(), 10);
+        assert_eq!(ix.accounts[7].pubkey, pk(8)); // asset
+        assert_eq!(ix.accounts[9].pubkey, pk(10)); // stablecoin_mint
+        assert_eq!(ix.data[0], 2);
+        let min = u64::from_le_bytes(ix.data[9..17].try_into().unwrap());
+        assert!(min > 0);
+    }
+
+    /// Multi-leg (Chainlink-stacked) assets append their extra oracle accounts
+    /// after `stablecoin_mint`, matching the program's `extra_oracles @ ..` tail.
+    #[test]
+    fn extra_oracle_legs_are_appended_in_order() {
+        let wrap = Wrap {
+            user: pk(1),
+            stablecoin_user_token_account: pk(2),
+            branded_user_token_account: pk(3),
+            proxy_state: pk(4),
+            stablecoin_proxy_state_vault: pk(5),
+            branded_mint: pk(6),
+            oracle: pk(7),
+            asset: pk(8),
+            token_program: pk(9),
+            stablecoin_mint: pk(10),
+            extra_oracles: vec![pk(11), pk(12)],
+        };
+
+        let ix = wrap.instruction(WrapInstructionArgs {
+            amount: 1,
+            min_branded_tokens: 1,
+        });
+
+        assert_eq!(ix.accounts.len(), 12);
+        assert_eq!(ix.accounts[10].pubkey, pk(11));
+        assert_eq!(ix.accounts[11].pubkey, pk(12));
+    }
+
+    #[test]
+    fn asset_pda_is_derived_off_the_stablecoin_mint() {
+        let mint = pk(42);
+        let asset = derive_asset_pda(&mint);
+        // Deterministic and program-owned derivation (does not equal the mint).
+        assert_eq!(asset, derive_asset_pda(&mint));
+        assert_ne!(asset, mint);
     }
 }
