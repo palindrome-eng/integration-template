@@ -318,16 +318,6 @@ impl TradingVenue for ReflectWhitelabelVenue {
     }
 
     fn quote(&self, request: QuoteRequest) -> Result<QuoteResult, TradingVenueError> {
-        if request.amount == 0 {
-            return Ok(QuoteResult {
-                input_mint: request.input_mint,
-                output_mint: request.output_mint,
-                amount: 0,
-                expected_output: 0,
-                not_enough_liquidity: false,
-            });
-        }
-
         let is_wrap = request.input_mint == self.keys.stablecoin_mint
             && request.output_mint == self.keys.branded_mint;
         let is_unwrap = request.input_mint == self.keys.branded_mint
@@ -335,6 +325,23 @@ impl TradingVenue for ReflectWhitelabelVenue {
 
         if !is_wrap && !is_unwrap {
             return Err(TradingVenueError::InvalidMint(request.input_mint.into()));
+        }
+
+        // Wrap and unwrap are both linear in the input amount, so the marginal
+        // price `f'(amount)` is constant and equal to the spot price at 0.
+        let price = self.spot_price(is_wrap)?;
+
+        // A zero-input quote produces no output, but Titan still expects the
+        // venue's spot price. See [`QuoteResult::price`].
+        if request.amount == 0 {
+            return Ok(QuoteResult {
+                input_mint: request.input_mint,
+                output_mint: request.output_mint,
+                amount: 0,
+                expected_output: 0,
+                not_enough_liquidity: false,
+                price,
+            });
         }
 
         let expected_output = if is_wrap {
@@ -351,6 +358,7 @@ impl TradingVenue for ReflectWhitelabelVenue {
             amount: request.amount,
             expected_output,
             not_enough_liquidity,
+            price,
         })
     }
 
@@ -442,6 +450,40 @@ impl ReflectWhitelabelVenue {
         self.principal
             .checked_add(generated_principal)
             .ok_or_else(|| TradingVenueError::MathError("overflow in new principal".into()))
+    }
+
+    /// Marginal price (output atoms per input atom) for a wrap or unwrap.
+    ///
+    /// Both `calculate_wrap_output` and `calculate_unwrap_output` are linear in
+    /// the input amount — the post-crank principal, branded supply, and oracle
+    /// price do not depend on the trade size — so `f'(amount)` is constant and
+    /// equals the venue's spot price at `amount == 0`. This satisfies Titan's
+    /// pricing invariants: the output curve is a positive-slope line, hence
+    /// monotone, concave (constant price), and consistent with the realized
+    /// average rate.
+    fn spot_price(&self, is_wrap: bool) -> Result<f64, TradingVenueError> {
+        let post_crank_principal = self.simulate_crank()?;
+
+        let supply_with_virtual = self.branded_supply as f64 + VIRTUAL_SHARES as f64;
+        let principal_with_virtual = post_crank_principal as f64 + VIRTUAL_ASSETS_USDC as f64;
+        let oracle_scale = 10f64.powi(self.oracle_precision as i32);
+        let oracle_price = self.oracle_price as f64;
+
+        if oracle_price <= 0.0 || oracle_scale <= 0.0 || principal_with_virtual <= 0.0 {
+            return Err(TradingVenueError::MathError(
+                "spot price is undefined for current venue state".into(),
+            ));
+        }
+
+        let price = if is_wrap {
+            // branded out per stablecoin in
+            (oracle_price / oracle_scale) * (supply_with_virtual / principal_with_virtual)
+        } else {
+            // stablecoin out per branded in
+            (principal_with_virtual / supply_with_virtual) * (oracle_scale / oracle_price)
+        };
+
+        Ok(price)
     }
 
     /// Calculate branded tokens output for a given stablecoin input (wrap).
