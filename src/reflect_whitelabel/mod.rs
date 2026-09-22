@@ -35,6 +35,26 @@ pub const ORACLE_ID: Pubkey = Pubkey::new_from_array([
     0x20, 0x10, 0x27, 0x35, 0x44, 0xf5, 0xa2, 0xa1,
 ]);
 
+/// PDA seed for the `Asset` registry account (`["asset", stablecoin_mint]`).
+/// The proxy program reads the oracle/feed identity from this account during
+/// wrap/unwrap, so it must be supplied with the swap instruction.
+const ASSET_SEED: &[u8] = b"asset";
+
+/// Minimum slippage bound passed to on-chain wrap/unwrap. The program rejects a
+/// zero minimum (it would disable slippage protection), and rejects zero output
+/// separately, so `1` is the smallest accepted value. Titan enforces real
+/// slippage at the route level.
+const MIN_OUTPUT_TOKENS: u64 = 1;
+
+/// Derive the `Asset` registry PDA for a given stablecoin mint.
+fn derive_asset_pda(stablecoin_mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[ASSET_SEED, stablecoin_mint.as_ref()],
+        &REFLECT_PROXY_PROGRAM_ID,
+    )
+    .0
+}
+
 /// Virtual shares offset for ERC4626-style inflation attack mitigation.
 const VIRTUAL_SHARES: u64 = 1_000_000;
 
@@ -105,6 +125,9 @@ pub struct ReflectWhitelabelKeys {
     pub stablecoin_mint: Pubkey,
     /// The authority of the proxy.
     pub authority: Pubkey,
+    /// The `Asset` registry PDA (`["asset", stablecoin_mint]`). Supplied to
+    /// wrap/unwrap so the program can read the oracle/feed identity.
+    pub asset: Pubkey,
     /// The oracle account for USDC+/USDC price.
     pub oracle: Pubkey,
     /// The token program for the stablecoin.
@@ -164,6 +187,7 @@ impl FromAccount for ReflectWhitelabelVenue {
             branded_mint: proxy_state.branded_mint,
             stablecoin_mint: proxy_state.stablecoin_mint,
             authority: proxy_state.authority,
+            asset: derive_asset_pda(&proxy_state.stablecoin_mint),
             oracle: ORACLE_ID,
             stablecoin_token_program,
             stablecoin_vault,
@@ -176,6 +200,7 @@ impl FromAccount for ReflectWhitelabelVenue {
             keys.stablecoin_mint,
             keys.stablecoin_vault,
             keys.oracle,
+            keys.asset,
         ]);
 
         Ok(Self {
@@ -580,12 +605,15 @@ impl ReflectWhitelabelVenue {
             stablecoin_proxy_state_vault: self.keys.stablecoin_vault,
             branded_mint: self.keys.branded_mint,
             oracle: self.keys.oracle,
+            asset: self.keys.asset,
             token_program: self.keys.stablecoin_token_program,
+            stablecoin_mint: self.keys.stablecoin_mint,
+            extra_oracles: Vec::new(),
         };
 
         let args = WrapInstructionArgs {
             amount,
-            min_branded_tokens: 0,
+            min_branded_tokens: MIN_OUTPUT_TOKENS,
         };
 
         Ok(wrap.instruction(args))
@@ -608,12 +636,15 @@ impl ReflectWhitelabelVenue {
             stablecoin_proxy_state_vault: self.keys.stablecoin_vault,
             branded_mint: self.keys.branded_mint,
             oracle: self.keys.oracle,
+            asset: self.keys.asset,
             token_program: self.keys.stablecoin_token_program,
+            stablecoin_mint: self.keys.stablecoin_mint,
+            extra_oracles: Vec::new(),
         };
 
         let args = UnwrapInstructionArgs {
             amount,
-            min_usdc_plus: 0,
+            min_usdc_plus: MIN_OUTPUT_TOKENS,
         };
 
         Ok(unwrap.instruction(args))
@@ -641,8 +672,130 @@ impl AddressLookupTableTrait for ReflectWhitelabelVenue {
             self.keys.stablecoin_mint,
             self.keys.stablecoin_vault,
             self.keys.oracle,
+            self.keys.asset,
             self.keys.stablecoin_token_program,
             REFLECT_PROXY_PROGRAM_ID,
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instructions::{Unwrap, UnwrapInstructionArgs, Wrap, WrapInstructionArgs};
+    use super::*;
+
+    fn pk(byte: u8) -> Pubkey {
+        Pubkey::new_from_array([byte; 32])
+    }
+
+    /// The deployed program (`main`) destructures wrap/unwrap accounts as a fixed
+    /// 10-slot array with `asset` at index 7 and `stablecoin_mint` at index 9,
+    /// followed by an optional oracle-chain tail. Lock that shape in.
+    #[test]
+    fn wrap_instruction_matches_onchain_account_layout() {
+        let wrap = Wrap {
+            user: pk(1),
+            stablecoin_user_token_account: pk(2),
+            branded_user_token_account: pk(3),
+            proxy_state: pk(4),
+            stablecoin_proxy_state_vault: pk(5),
+            branded_mint: pk(6),
+            oracle: pk(7),
+            asset: pk(8),
+            token_program: pk(9),
+            stablecoin_mint: pk(10),
+            extra_oracles: Vec::new(),
+        };
+
+        let ix = wrap.instruction(WrapInstructionArgs {
+            amount: 1_000,
+            min_branded_tokens: MIN_OUTPUT_TOKENS,
+        });
+
+        assert_eq!(ix.program_id, REFLECT_PROXY_PROGRAM_ID);
+        assert_eq!(ix.accounts.len(), 10, "single-leg wrap must pass 10 accounts");
+
+        // Order and mutability that the program's `WrapAccounts` destructure expects.
+        assert_eq!(ix.accounts[0].pubkey, pk(1));
+        assert!(ix.accounts[0].is_signer && !ix.accounts[0].is_writable);
+        assert!(ix.accounts[3].is_writable, "proxy_state must be mutable");
+        assert!(ix.accounts[5].is_writable, "branded_mint must be mutable");
+        assert_eq!(ix.accounts[6].pubkey, pk(7)); // oracle
+        assert_eq!(ix.accounts[7].pubkey, pk(8)); // asset
+        assert!(!ix.accounts[7].is_writable);
+        assert_eq!(ix.accounts[8].pubkey, pk(9)); // token_program
+        assert_eq!(ix.accounts[9].pubkey, pk(10)); // stablecoin_mint
+
+        // discriminator (1) + amount (8) + min (8)
+        assert_eq!(ix.data[0], 1);
+        assert_eq!(ix.data.len(), 17);
+        let min = u64::from_le_bytes(ix.data[9..17].try_into().unwrap());
+        assert!(min > 0, "on-chain rejects a zero minimum");
+    }
+
+    #[test]
+    fn unwrap_instruction_matches_onchain_account_layout() {
+        let unwrap = Unwrap {
+            user: pk(1),
+            stablecoin_user_token_account: pk(2),
+            branded_user_token_account: pk(3),
+            proxy_state: pk(4),
+            stablecoin_proxy_state_vault: pk(5),
+            branded_mint: pk(6),
+            oracle: pk(7),
+            asset: pk(8),
+            token_program: pk(9),
+            stablecoin_mint: pk(10),
+            extra_oracles: Vec::new(),
+        };
+
+        let ix = unwrap.instruction(UnwrapInstructionArgs {
+            amount: 1_000,
+            min_usdc_plus: MIN_OUTPUT_TOKENS,
+        });
+
+        assert_eq!(ix.accounts.len(), 10);
+        assert_eq!(ix.accounts[7].pubkey, pk(8)); // asset
+        assert_eq!(ix.accounts[9].pubkey, pk(10)); // stablecoin_mint
+        assert_eq!(ix.data[0], 2);
+        let min = u64::from_le_bytes(ix.data[9..17].try_into().unwrap());
+        assert!(min > 0);
+    }
+
+    /// Multi-leg (Chainlink-stacked) assets append their extra oracle accounts
+    /// after `stablecoin_mint`, matching the program's `extra_oracles @ ..` tail.
+    #[test]
+    fn extra_oracle_legs_are_appended_in_order() {
+        let wrap = Wrap {
+            user: pk(1),
+            stablecoin_user_token_account: pk(2),
+            branded_user_token_account: pk(3),
+            proxy_state: pk(4),
+            stablecoin_proxy_state_vault: pk(5),
+            branded_mint: pk(6),
+            oracle: pk(7),
+            asset: pk(8),
+            token_program: pk(9),
+            stablecoin_mint: pk(10),
+            extra_oracles: vec![pk(11), pk(12)],
+        };
+
+        let ix = wrap.instruction(WrapInstructionArgs {
+            amount: 1,
+            min_branded_tokens: 1,
+        });
+
+        assert_eq!(ix.accounts.len(), 12);
+        assert_eq!(ix.accounts[10].pubkey, pk(11));
+        assert_eq!(ix.accounts[11].pubkey, pk(12));
+    }
+
+    #[test]
+    fn asset_pda_is_derived_off_the_stablecoin_mint() {
+        let mint = pk(42);
+        let asset = derive_asset_pda(&mint);
+        // Deterministic and program-owned derivation (does not equal the mint).
+        assert_eq!(asset, derive_asset_pda(&mint));
+        assert_ne!(asset, mint);
     }
 }
