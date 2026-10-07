@@ -5,6 +5,7 @@
 //! and unwrap branded tokens back to USDC+.
 
 mod instructions;
+pub mod oracle;
 
 use ahash::HashSet;
 use async_trait::async_trait;
@@ -13,6 +14,8 @@ use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token_2022::{extension::StateWithExtensions, state::Mint};
+
+use oracle::{div_oracle, mul_oracle, real_price_f64, OracleLeg};
 
 use crate::{
     account_caching::AccountsCache,
@@ -55,17 +58,17 @@ fn derive_asset_pda(stablecoin_mint: &Pubkey) -> Pubkey {
     .0
 }
 
-/// Virtual shares offset for ERC4626-style inflation attack mitigation.
-const VIRTUAL_SHARES: u64 = 1_000_000;
-
-/// Virtual USDC assets offset for ERC4626-style inflation attack mitigation.
-const VIRTUAL_ASSETS_USDC: u64 = 1_000_000;
+/// Virtual accounting offset for ERC4626-style inflation-attack mitigation.
+///
+/// The on-chain program computes this dynamically as `10^branded_decimals`
+/// (e.g. `1_000_000` for a 6-decimal token). It is used as both the virtual
+/// share offset and the virtual asset offset.
+fn virtual_offset(branded_decimals: u8) -> u128 {
+    10u128.pow(branded_decimals as u32)
+}
 
 /// On-chain ProxyState size: 32 + 32 + 2 + 8 + 8 + 32 + 1 = 115 bytes
 const PROXY_STATE_LEN: usize = 115;
-
-/// Oracle account size: slot(8) + price(8) + precision(1) = 17 bytes
-const ORACLE_LEN: usize = 17;
 
 /// Parsed proxy state data from on-chain account.
 /// This matches the on-chain layout exactly:
@@ -157,10 +160,18 @@ pub struct ReflectWhitelabelVenue {
     pub branded_supply: u64,
     /// Current stablecoin balance in the vault.
     pub vault_balance: u64,
-    /// Oracle price (stablecoin per USDC, scaled by precision).
-    pub oracle_price: u64,
-    /// Oracle precision (decimal places).
-    pub oracle_precision: u8,
+    /// Composed oracle price for the asset's chain. `oracle_price * 10^oracle_exponent`
+    /// is the real USDC value of one stablecoin (USDC+) atom.
+    pub oracle_price: u128,
+    /// Signed exponent accompanying [`Self::oracle_price`] (from the composed chain).
+    pub oracle_exponent: i32,
+    /// Decimals of the branded mint, used for the virtual accounting offset.
+    pub branded_decimals: u8,
+    /// Parsed oracle-chain legs from the `Asset` account (leg 0 first).
+    oracle_legs: Vec<OracleLeg>,
+    /// Trailing oracle-leg accounts (legs 1..) appended to wrap/unwrap after
+    /// `stablecoin_mint`. Empty for single-leg assets.
+    extra_oracles: Vec<Pubkey>,
     /// Set of pubkeys required for state updates.
     required_state_pubkeys: HashSet<Pubkey>,
     /// Whether the venue has been fully initialized.
@@ -211,7 +222,10 @@ impl FromAccount for ReflectWhitelabelVenue {
             branded_supply: 0,
             vault_balance: 0,
             oracle_price: 0,
-            oracle_precision: 6, // Default to 6 decimals
+            oracle_exponent: 0,
+            branded_decimals: 6, // Default to 6 decimals until state is loaded.
+            oracle_legs: Vec::new(),
+            extra_oracles: Vec::new(),
             required_state_pubkeys,
             found_all_pubkeys: false,
             token_info: Vec::new(),
@@ -267,19 +281,22 @@ impl TradingVenue for ReflectWhitelabelVenue {
     }
 
     async fn update_state(&mut self, cache: &dyn AccountsCache) -> Result<(), TradingVenueError> {
+        // Phase 1: proxy state, mints, vault, and the Asset registry account. The
+        // oracle-chain legs live inside the Asset, so their accounts are only known
+        // after this fetch (phase 2 below).
         let accounts_pubkeys = vec![
             self.keys.proxy_state,
             self.keys.branded_mint,
             self.keys.stablecoin_mint,
             self.keys.stablecoin_vault,
-            self.keys.oracle,
+            self.keys.asset,
         ];
 
         self.required_state_pubkeys.extend(&accounts_pubkeys);
 
         let accounts = cache.get_accounts(&accounts_pubkeys).await?;
 
-        let [proxy_state_account, branded_mint_account, stablecoin_mint_account, vault_account, oracle_account]: [Option<Account>;
+        let [proxy_state_account, branded_mint_account, stablecoin_mint_account, vault_account, asset_account]: [Option<Account>;
             5] = accounts
             .try_into()
             .map_err(|_| TradingVenueError::FailedToFetchMultipleAccountData)?;
@@ -298,6 +315,7 @@ impl TradingVenue for ReflectWhitelabelVenue {
                 TradingVenueError::DeserializationFailed("Failed to parse branded mint".into())
             })?;
             self.branded_supply = mint.base.supply;
+            self.branded_decimals = mint.base.decimals;
         }
 
         if let Some(ref account) = stablecoin_mint_account {
@@ -318,14 +336,30 @@ impl TradingVenue for ReflectWhitelabelVenue {
             }
         }
 
-        if let Some(ref account) = oracle_account {
-            if account.data.len() >= ORACLE_LEN {
-                let price_bytes: [u8; 8] = account.data[8..16]
-                    .try_into()
-                    .map_err(|_| TradingVenueError::DeserializationFailed("oracle price".into()))?;
-                self.oracle_price = u64::from_le_bytes(price_bytes);
-                self.oracle_precision = account.data[16];
+        // Parse the Asset's oracle chain and resolve the composed price.
+        if let Some(ref account) = asset_account {
+            let legs = oracle::parse_asset_legs(&account.data)?;
+            let leg_accounts = oracle::leg_oracle_accounts(&legs);
+
+            // Leg 0 is the primary oracle the instruction passes as `oracle`; the
+            // rest form the `extra_oracles` tail.
+            self.keys.oracle = leg_accounts[0];
+            self.extra_oracles = leg_accounts[1..].to_vec();
+            self.oracle_legs = legs.clone();
+            self.required_state_pubkeys.extend(leg_accounts.iter().copied());
+
+            // Phase 2: fetch each leg's oracle account and compose the chain.
+            let fetched = cache.get_accounts(&leg_accounts).await?;
+            let mut resolved = Vec::with_capacity(leg_accounts.len());
+            for (leg_pubkey, maybe_account) in leg_accounts.iter().zip(fetched.into_iter()) {
+                let account = maybe_account
+                    .ok_or_else(|| TradingVenueError::NoAccountFound((*leg_pubkey).into()))?;
+                resolved.push((account.owner, account.data));
             }
+
+            let composed = oracle::resolve_price(&legs, &resolved)?;
+            self.oracle_price = composed.price;
+            self.oracle_exponent = composed.exponent;
         }
 
         if let (Some(stablecoin_account), Some(branded_account)) =
@@ -441,17 +475,32 @@ impl TradingVenue for ReflectWhitelabelVenue {
     }
 }
 
-impl ReflectWhitelabelVenue {
-    /// Simulate the crank operation that happens on-chain before wrap/unwrap.
-    /// Returns the post-crank principal value.
-    fn simulate_crank(&self) -> Result<u64, TradingVenueError> {
-        let vault_usdc_value = (self.vault_balance as u128)
-            .checked_mul(self.oracle_price as u128)
-            .and_then(|x| x.checked_div(10u128.pow(self.oracle_precision as u32)))
-            .ok_or_else(|| TradingVenueError::MathError("overflow in vault value".into()))?;
+/// Post-crank figures the wrap/unwrap share math prices against — the result of
+/// the on-chain `crank` plus `redeemable_principal`.
+struct CrankFigures {
+    /// Principal after settling accrued interest (the on-chain post-crank principal).
+    post_principal: u64,
+    /// What the branded shares actually claim on the vault: `post_principal`
+    /// capped at the vault value net of the unclaimed integrator commission.
+    /// Equal to `post_principal` on any settled tick; smaller only when an
+    /// unbooked price fall has left the vault worth less than principal +
+    /// commission.
+    redeemable: u64,
+    /// USDC value of the vault at the current composed oracle price.
+    vault_usdc_value: u64,
+}
 
-        let vault_usdc_value = u64::try_from(vault_usdc_value)
-            .map_err(|_| TradingVenueError::MathError("vault value overflow u64".into()))?;
+impl ReflectWhitelabelVenue {
+    /// Simulate the on-chain crank and derive the figures wrap/unwrap price
+    /// against. Mirrors `ProxyState::crank` followed by
+    /// `ProxyState::redeemable_principal`.
+    fn crank_figures(&self) -> Result<CrankFigures, TradingVenueError> {
+        let vault_usdc_value = u64::try_from(mul_oracle(
+            self.vault_balance as u128,
+            self.oracle_price,
+            self.oracle_exponent,
+        )?)
+        .map_err(|_| TradingVenueError::MathError("vault value overflow u64".into()))?;
 
         let total_principal_and_commission = self
             .principal
@@ -460,41 +509,61 @@ impl ReflectWhitelabelVenue {
 
         let interest_generated = vault_usdc_value.saturating_sub(total_principal_and_commission);
 
-        let generated_commission = (interest_generated as u128)
-            .checked_mul(self.fee_bps as u128)
-            .and_then(|x| x.checked_div(10_000))
-            .ok_or_else(|| TradingVenueError::MathError("overflow in commission".into()))?;
-
-        let generated_commission = u64::try_from(generated_commission)
-            .map_err(|_| TradingVenueError::MathError("commission overflow u64".into()))?;
+        let generated_commission = u64::try_from(
+            (interest_generated as u128)
+                .checked_mul(self.fee_bps as u128)
+                .and_then(|x| x.checked_div(10_000))
+                .ok_or_else(|| TradingVenueError::MathError("overflow in commission".into()))?,
+        )
+        .map_err(|_| TradingVenueError::MathError("commission overflow u64".into()))?;
 
         let generated_principal = interest_generated
             .checked_sub(generated_commission)
             .ok_or_else(|| TradingVenueError::MathError("underflow in principal share".into()))?;
 
-        self.principal
+        let post_principal = self
+            .principal
             .checked_add(generated_principal)
-            .ok_or_else(|| TradingVenueError::MathError("overflow in new principal".into()))
+            .ok_or_else(|| TradingVenueError::MathError("overflow in new principal".into()))?;
+
+        let post_commission = self
+            .integrators_commission
+            .checked_add(generated_commission)
+            .ok_or_else(|| TradingVenueError::MathError("overflow in new commission".into()))?;
+
+        // redeemable_principal: the recorded principal, capped at the vault value
+        // once the unclaimed commission is set aside. Equals `post_principal` on a
+        // settled tick (where vault value == principal + commission).
+        let redeemable = post_principal.min(vault_usdc_value.saturating_sub(post_commission));
+
+        Ok(CrankFigures {
+            post_principal,
+            redeemable,
+            vault_usdc_value,
+        })
     }
 
     /// Marginal price (output atoms per input atom) for a wrap or unwrap.
     ///
     /// Both `calculate_wrap_output` and `calculate_unwrap_output` are linear in
-    /// the input amount — the post-crank principal, branded supply, and oracle
+    /// the input amount — the redeemable principal, branded supply, and oracle
     /// price do not depend on the trade size — so `f'(amount)` is constant and
     /// equals the venue's spot price at `amount == 0`. This satisfies Titan's
     /// pricing invariants: the output curve is a positive-slope line, hence
     /// monotone, concave (constant price), and consistent with the realized
     /// average rate.
     fn spot_price(&self, is_wrap: bool) -> Result<f64, TradingVenueError> {
-        let post_crank_principal = self.simulate_crank()?;
+        let figures = self.crank_figures()?;
 
-        let supply_with_virtual = self.branded_supply as f64 + VIRTUAL_SHARES as f64;
-        let principal_with_virtual = post_crank_principal as f64 + VIRTUAL_ASSETS_USDC as f64;
-        let oracle_scale = 10f64.powi(self.oracle_precision as i32);
-        let oracle_price = self.oracle_price as f64;
+        let voff = virtual_offset(self.branded_decimals) as f64;
+        let supply_with_virtual = self.branded_supply as f64 + voff;
+        // The share math prices against the redeemable principal, not the raw
+        // post-crank principal (they differ only in an undercollateralized vault).
+        let redeemable_with_virtual = figures.redeemable as f64 + voff;
+        // Real USDC value of one stablecoin (USDC+) atom = price * 10^exponent.
+        let real_price = real_price_f64(self.oracle_price, self.oracle_exponent);
 
-        if oracle_price <= 0.0 || oracle_scale <= 0.0 || principal_with_virtual <= 0.0 {
+        if real_price <= 0.0 || redeemable_with_virtual <= 0.0 {
             return Err(TradingVenueError::MathError(
                 "spot price is undefined for current venue state".into(),
             ));
@@ -502,10 +571,10 @@ impl ReflectWhitelabelVenue {
 
         let price = if is_wrap {
             // branded out per stablecoin in
-            (oracle_price / oracle_scale) * (supply_with_virtual / principal_with_virtual)
+            real_price * (supply_with_virtual / redeemable_with_virtual)
         } else {
             // stablecoin out per branded in
-            (principal_with_virtual / supply_with_virtual) * (oracle_scale / oracle_price)
+            (redeemable_with_virtual / supply_with_virtual) / real_price
         };
 
         Ok(price)
@@ -513,31 +582,39 @@ impl ReflectWhitelabelVenue {
 
     /// Calculate branded tokens output for a given stablecoin input (wrap).
     fn calculate_wrap_output(&self, stablecoin_amount: u64) -> Result<u64, TradingVenueError> {
-        let post_crank_principal = self.simulate_crank()?;
+        let figures = self.crank_figures()?;
 
-        let input_usdc_value = (stablecoin_amount as u128)
-            .checked_mul(self.oracle_price as u128)
-            .and_then(|x| x.checked_div(10u128.pow(self.oracle_precision as u32)))
-            .ok_or_else(|| TradingVenueError::MathError("overflow in wrap calculation".into()))?;
+        // On-chain wrap refuses an undercollateralized vault — the mint and the
+        // burn must share one basis — and a vault whose shares claim nothing.
+        if figures.vault_usdc_value < figures.post_principal
+            || (figures.redeemable == 0 && self.branded_supply > 0)
+        {
+            return Err(TradingVenueError::InactivePoolError(
+                self.keys.proxy_state,
+                PoolProtocol::ReflectWhitelabel,
+            ));
+        }
 
-        let input_usdc_value_u64 = u64::try_from(input_usdc_value)
-            .map_err(|_| TradingVenueError::MathError("input USDC value overflow u64".into()))?;
-
-        post_crank_principal
-            .checked_add(input_usdc_value_u64)
-            .ok_or_else(|| TradingVenueError::MathError("principal addition would overflow".into()))?;
+        // Match the on-chain u64 truncation of the USDC value before the share math.
+        let input_usdc_value = u64::try_from(mul_oracle(
+            stablecoin_amount as u128,
+            self.oracle_price,
+            self.oracle_exponent,
+        )?)
+        .map_err(|_| TradingVenueError::MathError("input USDC value overflow u64".into()))?;
 
         let supply_with_virtual = (self.branded_supply as u128)
-            .checked_add(VIRTUAL_SHARES as u128)
+            .checked_add(virtual_offset(self.branded_decimals))
             .ok_or_else(|| TradingVenueError::MathError("overflow in supply".into()))?;
 
-        let principal_with_virtual = (post_crank_principal as u128)
-            .checked_add(VIRTUAL_ASSETS_USDC as u128)
+        // Price against the redeemable principal, matching on-chain.
+        let redeemable_with_virtual = (figures.redeemable as u128)
+            .checked_add(virtual_offset(self.branded_decimals))
             .ok_or_else(|| TradingVenueError::MathError("overflow in principal".into()))?;
 
-        let output = input_usdc_value
+        let output = (input_usdc_value as u128)
             .checked_mul(supply_with_virtual)
-            .and_then(|x| x.checked_div(principal_with_virtual))
+            .and_then(|x| x.checked_div(redeemable_with_virtual))
             .ok_or_else(|| TradingVenueError::MathError("overflow in wrap output".into()))?;
 
         u64::try_from(output)
@@ -552,37 +629,42 @@ impl ReflectWhitelabelVenue {
             ));
         }
 
-        let post_crank_principal = self.simulate_crank()?;
+        let figures = self.crank_figures()?;
+
+        // On-chain unwrap refuses a vault whose shares claim nothing.
+        if figures.redeemable == 0 && self.branded_supply > 0 {
+            return Err(TradingVenueError::InactivePoolError(
+                self.keys.proxy_state,
+                PoolProtocol::ReflectWhitelabel,
+            ));
+        }
 
         let supply_with_virtual = (self.branded_supply as u128)
-            .checked_add(VIRTUAL_SHARES as u128)
+            .checked_add(virtual_offset(self.branded_decimals))
             .ok_or_else(|| TradingVenueError::MathError("overflow in supply".into()))?;
 
-        let principal_with_virtual = (post_crank_principal as u128)
-            .checked_add(VIRTUAL_ASSETS_USDC as u128)
+        // The payout is priced against the redeemable principal, so an exiter
+        // cannot draw on the integrator commission or uncovered collateral.
+        let redeemable_with_virtual = (figures.redeemable as u128)
+            .checked_add(virtual_offset(self.branded_decimals))
             .ok_or_else(|| TradingVenueError::MathError("overflow in principal".into()))?;
 
-        // Calculate USDC value of user's share
-        let user_share_usdc_value = (branded_amount as u128)
-            .checked_mul(principal_with_virtual)
-            .and_then(|x| x.checked_div(supply_with_virtual))
-            .ok_or_else(|| {
-                TradingVenueError::MathError("overflow in unwrap share calculation".into())
-            })?;
+        // Match the on-chain u64 truncation of the share value before converting.
+        let user_share_usdc_value = u64::try_from(
+            (branded_amount as u128)
+                .checked_mul(redeemable_with_virtual)
+                .and_then(|x| x.checked_div(supply_with_virtual))
+                .ok_or_else(|| {
+                    TradingVenueError::MathError("overflow in unwrap share calculation".into())
+                })?,
+        )
+        .map_err(|_| TradingVenueError::MathError("user share USDC value overflow u64".into()))?;
 
-        let user_share_usdc_value_u64 = u64::try_from(user_share_usdc_value)
-            .map_err(|_| TradingVenueError::MathError("user share USDC value overflow u64".into()))?;
-
-        post_crank_principal
-            .checked_sub(user_share_usdc_value_u64)
-            .ok_or_else(|| TradingVenueError::MathError("principal subtraction would underflow".into()))?;
-
-        let stablecoin_out = user_share_usdc_value
-            .checked_mul(10u128.pow(self.oracle_precision as u32))
-            .and_then(|x| x.checked_div(self.oracle_price as u128))
-            .ok_or_else(|| {
-                TradingVenueError::MathError("overflow in unwrap output calculation".into())
-            })?;
+        let stablecoin_out = div_oracle(
+            user_share_usdc_value as u128,
+            self.oracle_price,
+            self.oracle_exponent,
+        )?;
 
         u64::try_from(stablecoin_out)
             .map_err(|_| TradingVenueError::MathError("unwrap output overflow u64".into()))
@@ -608,7 +690,7 @@ impl ReflectWhitelabelVenue {
             asset: self.keys.asset,
             token_program: self.keys.stablecoin_token_program,
             stablecoin_mint: self.keys.stablecoin_mint,
-            extra_oracles: Vec::new(),
+            extra_oracles: self.extra_oracles.clone(),
         };
 
         let args = WrapInstructionArgs {
@@ -639,7 +721,7 @@ impl ReflectWhitelabelVenue {
             asset: self.keys.asset,
             token_program: self.keys.stablecoin_token_program,
             stablecoin_mint: self.keys.stablecoin_mint,
-            extra_oracles: Vec::new(),
+            extra_oracles: self.extra_oracles.clone(),
         };
 
         let args = UnwrapInstructionArgs {
@@ -654,9 +736,17 @@ impl ReflectWhitelabelVenue {
         self.keys.oracle = oracle;
     }
 
-    pub fn set_oracle_price(&mut self, price: u64, precision: u8) {
+    /// Override the composed oracle price. `price * 10^exponent` is the real USDC
+    /// value of one stablecoin (USDC+) atom. Primarily for tests.
+    pub fn set_oracle_price(&mut self, price: u128, exponent: i32) {
         self.oracle_price = price;
-        self.oracle_precision = precision;
+        self.oracle_exponent = exponent;
+    }
+
+    /// Override the branded-mint decimals used for the virtual accounting offset.
+    /// Primarily for tests.
+    pub fn set_branded_decimals(&mut self, decimals: u8) {
+        self.branded_decimals = decimals;
     }
 }
 
@@ -666,7 +756,7 @@ impl AddressLookupTableTrait for ReflectWhitelabelVenue {
         &self,
         _accounts_cache: Option<&dyn AccountsCache>,
     ) -> Result<Vec<Pubkey>, TradingVenueError> {
-        Ok(vec![
+        let mut keys = vec![
             self.keys.proxy_state,
             self.keys.branded_mint,
             self.keys.stablecoin_mint,
@@ -675,7 +765,9 @@ impl AddressLookupTableTrait for ReflectWhitelabelVenue {
             self.keys.asset,
             self.keys.stablecoin_token_program,
             REFLECT_PROXY_PROGRAM_ID,
-        ])
+        ];
+        keys.extend(self.extra_oracles.iter().copied());
+        Ok(keys)
     }
 }
 
@@ -797,5 +889,70 @@ mod tests {
         // Deterministic and program-owned derivation (does not equal the mint).
         assert_eq!(asset, derive_asset_pda(&mint));
         assert_ne!(asset, mint);
+    }
+
+    /// Build a venue in a fixed state for exercising the quote math directly.
+    /// Oracle is a 1.0 USDC/USDC+ price (`1e6` at exponent `-6`); branded token
+    /// has 6 decimals (virtual offset `1e6`).
+    fn quote_venue(
+        principal: u64,
+        integrators_commission: u64,
+        fee_bps: u16,
+        branded_supply: u64,
+        vault_balance: u64,
+    ) -> ReflectWhitelabelVenue {
+        ReflectWhitelabelVenue {
+            keys: ReflectWhitelabelKeys {
+                proxy_state: pk(4),
+                branded_mint: pk(6),
+                stablecoin_mint: pk(20),
+                authority: pk(21),
+                asset: pk(8),
+                oracle: pk(7),
+                stablecoin_token_program: spl_token::ID,
+                stablecoin_vault: pk(5),
+                bump: 255,
+            },
+            principal,
+            integrators_commission,
+            fee_bps,
+            branded_supply,
+            vault_balance,
+            oracle_price: 1_000_000,
+            oracle_exponent: -6,
+            branded_decimals: 6,
+            oracle_legs: Vec::new(),
+            extra_oracles: Vec::new(),
+            required_state_pubkeys: ahash::HashSet::default(),
+            found_all_pubkeys: true,
+            token_info: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn redeemable_principal_leaves_healthy_quotes_unchanged() {
+        // Settled tick: vault value == principal + commission, so redeemable ==
+        // principal and the quotes match the pre-audit (principal-based) math.
+        let v = quote_venue(100_000_000, 0, 1_000, 100_000_000, 100_000_000);
+        assert_eq!(v.calculate_wrap_output(10_000_000).unwrap(), 10_000_000);
+        assert_eq!(v.calculate_unwrap_output(10_000_000).unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn redeemable_principal_caps_payout_when_undercollateralized() {
+        // Unbooked fall: vault (90) < principal (100) + commission (10), so
+        // redeemable = min(100, 90 - 10) = 80, below principal.
+        let v = quote_venue(100_000_000, 10_000_000, 1_000, 100_000_000, 90_000_000);
+
+        // Unwrap now prices against redeemable (80), not principal (100):
+        // 10e6 * (80e6 + 1e6) / (100e6 + 1e6) = 8_019_801, down from 10e6.
+        assert_eq!(v.calculate_unwrap_output(10_000_000).unwrap(), 8_019_801);
+
+        // Wrap into a vault worth less than principal is refused, matching the
+        // on-chain `VaultUndercollateralized` guard.
+        assert!(matches!(
+            v.calculate_wrap_output(10_000_000),
+            Err(TradingVenueError::InactivePoolError(_, PoolProtocol::ReflectWhitelabel))
+        ));
     }
 }
